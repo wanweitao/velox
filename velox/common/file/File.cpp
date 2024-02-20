@@ -19,11 +19,15 @@
 
 #include <fmt/format.h>
 #include <glog/logging.h>
+#include <atomic>
 #include <memory>
 #include <stdexcept>
 
 #include <fcntl.h>
 #include <folly/portability/SysUio.h>
+
+std::atomic<uint64_t> read_bytes{0}, total_read_bytes{0};
+std::atomic<uint64_t> read_requests{0}, total_read_requests{0};
 
 namespace facebook::velox {
 
@@ -166,6 +170,10 @@ uint64_t LocalReadFile::preadv(
   auto readvFunc = [&]() -> ssize_t {
     const auto bytesRead =
         folly::preadv(fd_, iovecs.data(), iovecs.size(), offset);
+    read_bytes.fetch_add(bytesRead);
+    total_read_bytes.fetch_add(bytesRead, std::memory_order_relaxed);
+    read_requests.fetch_add(1);
+    total_read_requests.fetch_add(1, std::memory_order_relaxed);
     if (bytesRead < 0) {
       LOG(ERROR) << "preadv failed with error: " << folly::errnoStr(errno);
     } else {

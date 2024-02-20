@@ -19,6 +19,8 @@
 #include "velox/exec/Task.h"
 #include "velox/expression/Expr.h"
 
+std::atomic<uint64_t> table_scan_rows{0}, total_table_scan_rows{0};
+
 using facebook::velox::common::testutil::TestValue;
 
 namespace facebook::velox::exec {
@@ -264,6 +266,9 @@ RowVectorPtr TableScan::getOutput() {
               {maxFilteringRatio_,
                1.0 * data->size() / readBatchSize,
                1.0 / kMaxSelectiveBatchSizeMultiplier});
+          table_scan_rows.fetch_add(data->size());
+          total_table_scan_rows.fetch_add(
+              data->size(), std::memory_order_relaxed);
           return data;
         }
         continue;

@@ -37,3 +37,5 @@ if(${VELOX_ENABLE_BENCHMARKS})
   add_subdirectory(tpch)
   add_subdirectory(filesystem)
 endif()
+
+add_subdirectory(scan)

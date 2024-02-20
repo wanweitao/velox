@@ -1988,6 +1988,140 @@ TpchPlan TpchQueryBuilder::getQ22Plan() const {
   return context;
 }
 
+/*
+{
+    "selectivity": 1.0,
+    "cols": 1,
+    "sql": "SELECT max(l_shipdate) as max_shipdate FROM lineitem WHERE
+l_shipdate > date '1992-01-02';"
+},
+{
+    "selectivity": 0.8,
+    "cols": 1,
+    "sql": "SELECT max(l_shipdate) as max_shipdate FROM lineitem WHERE
+l_shipdate > date '1993-07-06';"
+},
+{
+    "selectivity": 0.6,
+    "cols": 1,
+    "sql": "SELECT max(l_shipdate) as max_shipdate FROM lineitem WHERE
+l_shipdate > date '1994-10-20';"
+},
+{
+    "selectivity": 0.4,
+    "cols": 1,
+    "sql": "SELECT max(l_shipdate) as max_shipdate FROM lineitem WHERE
+l_shipdate > date '1996-02-10';"
+},
+{
+    "selectivity": 0.2,
+    "cols": 1,
+    "sql": "SELECT max(l_shipdate) as max_shipdate FROM lineitem WHERE
+l_shipdate > date '1997-06-10';"
+}
+
+{
+    "name": "qtest-columns-1-selectivity-1.0",
+    "selectivity": 1.0,
+    "cols": 1,
+    "sql": "SELECT max(l_shipdate) as max_shipdate FROM lineitem;"
+},
+{
+    "name": "qtest-columns-2-selectivity-1.0",
+    "selectivity": 1.0,
+    "cols": 2,
+    "sql": "SELECT max(l_shipdate) as max_shipdate, max(l_orderkey) as
+max_orderkey FROM lineitem;"
+},
+{
+    "name": "qtest-columns-4-selectivity-1.0",
+    "selectivity": 1.0,
+    "cols": 4,
+    "sql": "SELECT max(l_shipdate) as max_shipdate, max(l_orderkey) as
+max_orderkey, max(l_partkey) as max_partkey, max(l_suppkey) as max_suppkey FROM
+lineitem;"
+},
+{
+    "name": "qtest-columns-8-selectivity-1.0",
+    "selectivity": 1.0,
+    "cols": 8,
+    "sql": "SELECT max(l_shipdate) as max_shipdate, max(l_orderkey) as
+max_orderkey, max(l_partkey) as max_partkey, max(l_suppkey) as max_suppkey,
+sum(l_linenumber) as sum_line, sum(l_quantity) as sum_qty, sum(l_extendedprice)
+as sum_base_price, sum(l_discount) as sum_disc FROM lineitem;"
+}
+*/
+TpchPlan TpchQueryBuilder::getScanPlan(int columns, double selectivity) const {
+  std::vector<std::string> selectedColumns, aggregates;
+  switch (columns) {
+    case 8:
+      // l_linenumber
+      selectedColumns.push_back("l_linenumber");
+      aggregates.push_back("sum(l_linenumber)");
+      // l_quantity
+      selectedColumns.push_back("l_quantity");
+      aggregates.push_back("sum(l_quantity)");
+    case 6:
+      // l_extendedprice
+      selectedColumns.push_back("l_extendedprice");
+      aggregates.push_back("sum(l_extendedprice)");
+      // l_discount
+      selectedColumns.push_back("l_discount");
+      aggregates.push_back("sum(l_discount)");
+    case 4:
+      // l_partkey
+      selectedColumns.push_back("l_partkey");
+      aggregates.push_back("max(l_partkey)");
+      // l_suppkey
+      selectedColumns.push_back("l_suppkey");
+      aggregates.push_back("max(l_suppkey)");
+    case 2:
+      // l_tax
+      selectedColumns.push_back("l_tax");
+      aggregates.push_back("sum(l_tax)");
+    case 1:
+      // l_shipdate
+      selectedColumns.push_back("l_shipdate");
+      aggregates.push_back("max(l_shipdate)");
+  }
+
+  const auto selectedRowType = getRowType(kLineitem, selectedColumns);
+  const auto& fileColumnNames = getFileColumnNames(kLineitem);
+
+  // shipdate >= 'xxxx'
+  const auto shipDate = "l_shipdate";
+  std::string lowerBound;
+  if (selectivity <= 0.2) {
+    lowerBound = "'1997-06-09'";
+  } else if (selectivity <= 0.4) {
+    lowerBound = "'1996-02-09'";
+  } else if (selectivity <= 0.6) {
+    lowerBound = "'1994-10-19'";
+  } else if (selectivity <= 0.8) {
+    lowerBound = "'1993-07-05'";
+  } else {
+    lowerBound = "'1992-01-01'";
+  }
+  auto filter = formatDateFilter(shipDate, selectedRowType, lowerBound, "");
+
+  core::PlanNodeId lineitemPlanNodeId;
+
+  auto plan =
+      PlanBuilder(pool_.get())
+          .tableScan(kLineitem, selectedRowType, fileColumnNames, {filter})
+          .capturePlanNodeId(lineitemPlanNodeId)
+          .partialAggregation({}, aggregates)
+          .localPartition(std::vector<std::string>{})
+          .finalAggregation()
+          .planNode();
+
+  TpchPlan context;
+  context.plan = std::move(plan);
+  context.dataFiles[lineitemPlanNodeId] = getTableFilePaths(kLineitem);
+  context.dataFileFormat = format_;
+  return context;
+}
+
 TpchPlan TpchQueryBuilder::getIoMeterPlan(int columnPct) const {
   VELOX_CHECK(columnPct > 0 && columnPct <= 100);
   auto columns = getFileColumnNames(kLineitem);

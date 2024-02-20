@@ -45,6 +45,9 @@
 #include <aws/s3/model/HeadObjectRequest.h>
 #include <aws/s3/model/UploadPartRequest.h>
 
+std::atomic<uint64_t> s3_read_bytes{0}, s3_total_read_bytes{0};
+std::atomic<uint64_t> s3_read_requests{0}, s3_total_read_requests{0};
+
 namespace facebook::velox {
 namespace {
 // Reference: https://issues.apache.org/jira/browse/ARROW-8692
@@ -180,6 +183,10 @@ class S3ReadFile final : public ReadFile {
     request.SetResponseStreamFactory(
         AwsWriteableStreamFactory(position, length));
     auto outcome = client_->GetObject(request);
+    s3_read_bytes.fetch_add(length);
+    s3_total_read_bytes.fetch_add(length, std::memory_order_relaxed);
+    s3_read_requests.fetch_add(1);
+    s3_total_read_requests.fetch_add(1, std::memory_order_relaxed);
     VELOX_CHECK_AWS_OUTCOME(outcome, "Failed to get S3 object", bucket_, key_);
   }
 

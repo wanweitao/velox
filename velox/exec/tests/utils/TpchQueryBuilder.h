@@ -71,6 +71,7 @@ class TpchQueryBuilder {
   /// Get the query plan for a given TPC-H query number.
   /// @param queryId TPC-H query number
   TpchPlan getQueryPlan(int queryId) const;
+  TpchPlan getScanPlan(int columns, double selectivity) const;
 
   /// Returns a plan for select max(c1), max(c2), .. from lineitem where partkey
   /// between
