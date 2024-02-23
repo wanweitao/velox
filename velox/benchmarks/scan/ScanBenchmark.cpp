@@ -30,6 +30,7 @@
 #include "velox/common/memory/MmapAllocator.h"
 #include "velox/connectors/hive/HiveConfig.h"
 #include "velox/connectors/hive/HiveConnector.h"
+#include "velox/connectors/hive/storage_adapters/s3fs/RegisterS3FileSystem.h"
 #include "velox/dwio/common/Options.h"
 #include "velox/exec/PlanNodeStats.h"
 #include "velox/exec/Split.h"
@@ -357,6 +358,7 @@ class ScanBenchmark {
     if (cache_) {
       cache_->shutdown();
     }
+    filesystems::finalizeS3FileSystem();
   }
 
   std::pair<std::unique_ptr<TaskCursor>, std::vector<RowVectorPtr>> run(

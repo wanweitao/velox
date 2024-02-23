@@ -485,8 +485,9 @@ struct AwsInstance {
   void doInitialize(const Config* config) {
     std::shared_ptr<HiveConfig> hiveConfig = std::make_shared<HiveConfig>(
         std::make_shared<core::MemConfig>(config->values()));
-    awsOptions_.loggingOptions.logLevel =
-        inferS3LogLevel(hiveConfig->s3GetLogLevel());
+    // always disable S3 log
+    awsOptions_.loggingOptions.logLevel = inferS3LogLevel("OFF");
+    //    inferS3LogLevel(hiveConfig->s3GetLogLevel());
     // In some situations, curl triggers a SIGPIPE signal causing the entire
     // process to be terminated without any notification.
     // This behavior is seen via Prestissimo on AmazonLinux2 on AWS EC2.
@@ -523,11 +524,18 @@ void finalizeS3() {
 class S3FileSystem::Impl {
  public:
   Impl(const Config* config) {
-    hiveConfig_ = std::make_shared<HiveConfig>(
-        std::make_shared<core::MemConfig>(config->values()));
+    if (config) {
+      hiveConfig_ = std::make_shared<HiveConfig>(
+          std::make_shared<core::MemConfig>(config->values()));
+    } else {
+      hiveConfig_ =
+          std::make_shared<HiveConfig>(std::make_shared<core::MemConfig>());
+    }
     VELOX_CHECK(getAwsInstance()->isInitialized(), "S3 is not initialized");
     Aws::Client::ClientConfiguration clientConfig;
-    clientConfig.endpointOverride = hiveConfig_->s3Endpoint();
+    // clientConfig.endpointOverride = hiveConfig_->s3Endpoint();
+    // Enforce HTTP endpoint
+    clientConfig.endpointOverride = "http://s3-ap-northeast-1.amazonaws.com";
 
     if (hiveConfig_->s3UseProxyFromEnv()) {
       auto proxyConfig = S3ProxyConfigurationBuilder(hiveConfig_->s3Endpoint())
@@ -543,11 +551,13 @@ class S3FileSystem::Impl {
       }
     }
 
-    if (hiveConfig_->s3UseSSL()) {
-      clientConfig.scheme = Aws::Http::Scheme::HTTPS;
-    } else {
-      clientConfig.scheme = Aws::Http::Scheme::HTTP;
-    }
+    // if (hiveConfig_->s3UseSSL()) {
+    //   clientConfig.scheme = Aws::Http::Scheme::HTTPS;
+    // } else {
+    //   clientConfig.scheme = Aws::Http::Scheme::HTTP;
+    // }
+    // Enforce HTTP
+    clientConfig.scheme = Aws::Http::Scheme::HTTP;
 
     if (hiveConfig_->s3ConnectTimeout().has_value()) {
       clientConfig.connectTimeoutMs =
