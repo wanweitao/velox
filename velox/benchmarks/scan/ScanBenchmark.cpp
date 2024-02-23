@@ -376,19 +376,27 @@ class ScanBenchmark {
         bool noMoreSplits = false;
         auto addSplits = [&](exec::Task* task) {
           if (!noMoreSplits) {
+            auto ioExecutor = std::make_unique<folly::IOThreadPoolExecutor>(
+                FLAGS_num_io_threads);
             for (const auto& entry : tpchPlan.dataFiles) {
               for (const auto& path : entry.second) {
-                auto const splits =
-                    HiveConnectorTestBase::makeHiveConnectorSplits(
-                        path, numSplitsPerFile, tpchPlan.dataFileFormat);
-                for (const auto& split : splits) {
-                  task->addSplit(entry.first, exec::Split(split));
-                }
+                ioExecutor->add([=]() {
+                  auto const splits =
+                      HiveConnectorTestBase::makeHiveConnectorSplits(
+                          path, numSplitsPerFile, tpchPlan.dataFileFormat);
+                  for (const auto& split : splits) {
+                    task->addSplit(entry.first, exec::Split(split));
+                  }
+                });
               }
+            }
+            ioExecutor->join();
+            for (const auto& entry : tpchPlan.dataFiles) {
               task->noMoreSplits(entry.first);
             }
           }
           noMoreSplits = true;
+          std::fprintf(stderr, "\n\nnoMoreSplits\n\n");
         };
         auto result = readCursor(params, addSplits);
         ensureTaskCompletion(result.first->task().get());
