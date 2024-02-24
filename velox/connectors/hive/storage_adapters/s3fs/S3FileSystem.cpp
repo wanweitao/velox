@@ -537,6 +537,9 @@ class S3FileSystem::Impl {
     // Enforce HTTP endpoint
     clientConfig.endpointOverride = "http://s3-ap-northeast-1.amazonaws.com";
 
+    // Allow more connections
+    clientConfig.maxConnections = 8192;
+
     if (hiveConfig_->s3UseProxyFromEnv()) {
       auto proxyConfig = S3ProxyConfigurationBuilder(hiveConfig_->s3Endpoint())
                              .useSsl(hiveConfig_->s3UseSSL())

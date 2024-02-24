@@ -23,6 +23,7 @@
 #include <gflags/gflags.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <chrono>
 #include <fstream>
 
 #include "velox/common/base/SuccinctPrinter.h"
@@ -162,22 +163,28 @@ DEFINE_int32(
     8,
     "Checkpoint every n "
     "GB new data in cache");
-DEFINE_bool(
-    clear_ram_cache,
-    false,
-    "Clear RAM cache before each query."
-    "Flushes in process and OS file system cache (if root on Linux)");
-DEFINE_bool(
-    clear_ssd_cache,
-    false,
-    "Clears SSD cache before "
-    "each query");
 
-DEFINE_bool(
-    warmup_after_clear,
-    false,
-    "Runs one warmup of the query before "
-    "measured run. Use to run warm after clearing caches.");
+DEFINE_int32(
+    num_adding_split_threads,
+    1,
+    "Number of threads when adding splits");
+
+// DEFINE_bool(
+//     clear_ram_cache,
+//     false,
+//     "Clear RAM cache before each query."
+//     "Flushes in process and OS file system cache (if root on Linux)");
+// DEFINE_bool(
+//     clear_ssd_cache,
+//     false,
+//     "Clears SSD cache before "
+//     "each query");
+
+// DEFINE_bool(
+//     warmup_after_clear,
+//     false,
+//     "Runs one warmup of the query before "
+//     "measured run. Use to run warm after clearing caches.");
 
 DEFINE_bool(
     pretty_print,
@@ -376,8 +383,11 @@ class ScanBenchmark {
         bool noMoreSplits = false;
         auto addSplits = [&](exec::Task* task) {
           if (!noMoreSplits) {
+            std::fprintf(stderr, "\n\nAdding Splits\n\n");
+            auto start_time = std::chrono::system_clock::now();
+
             auto ioExecutor = std::make_unique<folly::IOThreadPoolExecutor>(
-                FLAGS_num_io_threads);
+                FLAGS_num_adding_split_threads);
             for (const auto& entry : tpchPlan.dataFiles) {
               for (const auto& path : entry.second) {
                 ioExecutor->add([=]() {
@@ -394,9 +404,16 @@ class ScanBenchmark {
             for (const auto& entry : tpchPlan.dataFiles) {
               task->noMoreSplits(entry.first);
             }
+
+            auto end_time = std::chrono::system_clock::now();
+            std::fprintf(
+                stderr,
+                "\n\nNo More Splits\n\ntime: %ld ms\n\n",
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    end_time - start_time)
+                    .count());
           }
           noMoreSplits = true;
-          std::fprintf(stderr, "\n\nnoMoreSplits\n\n");
         };
         auto result = readCursor(params, addSplits);
         ensureTaskCompletion(result.first->task().get());
