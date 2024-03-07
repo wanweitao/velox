@@ -16,27 +16,29 @@
 
 #include <fcntl.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <sys/time.h>
+#include <sys/types.h>
 
 #include <folly/Benchmark.h>
 #include <folly/init/Init.h>
 #include <gflags/gflags.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <chrono>
-#include <fstream>
 
+#include <chrono>
+
+#include "velox/benchmarks/scan/ScanQueryBuilder.h"
 #include "velox/common/base/SuccinctPrinter.h"
 #include "velox/common/file/FileSystems.h"
-#include "velox/common/memory/MmapAllocator.h"
 #include "velox/connectors/hive/HiveConfig.h"
 #include "velox/connectors/hive/HiveConnector.h"
 #include "velox/connectors/hive/storage_adapters/s3fs/RegisterS3FileSystem.h"
 #include "velox/dwio/common/Options.h"
+#include "velox/exec/Exchange.h"
 #include "velox/exec/PlanNodeStats.h"
 #include "velox/exec/Split.h"
 #include "velox/exec/tests/utils/HiveConnectorTestBase.h"
-#include "velox/exec/tests/utils/TpchQueryBuilder.h"
+#include "velox/exec/tests/utils/LocalExchangeSource.h"
+#include "velox/exec/tests/utils/PlanBuilder.h"
 #include "velox/functions/prestosql/aggregates/RegisterAggregateFunctions.h"
 #include "velox/functions/prestosql/registration/RegistrationFunctions.h"
 #include "velox/parse/TypeResolver.h"
@@ -54,6 +56,50 @@ extern std::atomic<uint64_t> s3_read_bytes, s3_total_read_bytes;
 extern std::atomic<uint64_t> s3_read_requests, s3_total_read_requests;
 
 namespace {
+
+int64_t toDate(std::string_view stringDate) {
+  return DATE()->toDays(stringDate);
+}
+
+/// DWRF does not support Date type and Varchar is used.
+/// Return the Date filter expression as per data format.
+std::string formatDateFilter(
+    const std::string& stringDate,
+    const RowTypePtr& rowType,
+    const std::string& lowerBound,
+    const std::string& upperBound) {
+  bool isDwrf = rowType->findChild(stringDate)->isVarchar();
+  auto suffix = isDwrf ? "" : "::DATE";
+
+  if (!lowerBound.empty() && !upperBound.empty()) {
+    return fmt::format(
+        "{} between {}{} and {}{}",
+        stringDate,
+        lowerBound,
+        suffix,
+        upperBound,
+        suffix);
+  } else if (!lowerBound.empty()) {
+    return fmt::format("{} > {}{}", stringDate, lowerBound, suffix);
+  } else if (!upperBound.empty()) {
+    return fmt::format("{} < {}{}", stringDate, upperBound, suffix);
+  }
+
+  VELOX_FAIL(
+      "Date range check expression must have either a lower or an upper bound");
+}
+
+std::vector<std::string> mergeColumnNames(
+    const std::vector<std::string>& firstColumnVector,
+    const std::vector<std::string>& secondColumnVector) {
+  std::vector<std::string> mergedColumnVector = std::move(firstColumnVector);
+  mergedColumnVector.insert(
+      mergedColumnVector.end(),
+      secondColumnVector.begin(),
+      secondColumnVector.end());
+  return mergedColumnVector;
+};
+
 static bool notEmpty(const char* /*flagName*/, const std::string& value) {
   return !value.empty();
 }
@@ -85,6 +131,26 @@ void ensureTaskCompletion(exec::Task* task) {
   ASSERT_TRUE(waitForTaskCompletion(task));
 }
 
+std::string printRow(std::shared_ptr<RowVector> vector, vector_size_t row_id) {
+  std::stringstream out;
+  out << "{";
+  for (int32_t col_id = 0; col_id < vector->childrenSize(); ++col_id) {
+    if (col_id > 0) {
+      out << ", ";
+    }
+    auto col_vector = vector->childAt(col_id);
+    std::string str = col_vector ? col_vector->toString(row_id) : "<not set>";
+    if (col_vector && col_vector->type()->isDate()) {
+      str = DATE()->toString(
+          col_vector->asFlatVector<int32_t>()->valueAt(row_id));
+    }
+    out << str;
+  }
+  out << "}\n";
+
+  return out.str();
+}
+
 void printResults(const std::vector<RowVectorPtr>& results, std::ostream& out) {
   out << "Results:" << std::endl;
   bool printType = true;
@@ -95,7 +161,7 @@ void printResults(const std::vector<RowVectorPtr>& results, std::ostream& out) {
       printType = false;
     }
     for (vector_size_t i = 0; i < vector->size(); ++i) {
-      out << vector->toString(i) << std::endl;
+      out << printRow(vector, i);
     }
   }
 }
@@ -119,17 +185,6 @@ DEFINE_string(
     "data file, one per line. This allows running against cloud storage or "
     "HDFS");
 
-// DEFINE_int32(
-//     run_query_verbose,
-//     -1,
-//     "Run a given query and print execution statistics");
-DEFINE_int32(
-    io_meter_column_pct,
-    0,
-    "Percentage of lineitem columns to "
-    "include in IO meter query. The columns are sorted by name and the n% first "
-    "are scanned");
-
 DEFINE_bool(
     include_custom_stats,
     false,
@@ -143,18 +198,8 @@ DEFINE_int32(
     0,
     "GB of process memory for cache and query.. if "
     "non-0, uses mmap to allocator and in-process data cache.");
-DEFINE_int32(num_repeats, 1, "Number of times to run each query");
+DEFINE_int32(num_threads, 8, "Threads in CPU threads pool");
 DEFINE_int32(num_io_threads, 8, "Threads for speculative IO");
-DEFINE_string(
-    test_flags_file,
-    "",
-    "Path to a file containing gflafs and "
-    "values to try. Produces results for each flag combination "
-    "sorted on performance");
-DEFINE_bool(
-    full_sorted_stats,
-    true,
-    "Add full stats to the report on  --test_flags_file");
 
 DEFINE_string(ssd_path, "", "Directory for local SSD cache");
 DEFINE_int32(ssd_cache_gb, 0, "Size of local SSD cache in GB");
@@ -168,23 +213,6 @@ DEFINE_int32(
     num_adding_split_threads,
     1,
     "Number of threads when adding splits");
-
-// DEFINE_bool(
-//     clear_ram_cache,
-//     false,
-//     "Clear RAM cache before each query."
-//     "Flushes in process and OS file system cache (if root on Linux)");
-// DEFINE_bool(
-//     clear_ssd_cache,
-//     false,
-//     "Clears SSD cache before "
-//     "each query");
-
-// DEFINE_bool(
-//     warmup_after_clear,
-//     false,
-//     "Runs one warmup of the query before "
-//     "measured run. Use to run warm after clearing caches.");
 
 DEFINE_bool(
     pretty_print,
@@ -245,29 +273,7 @@ void report_request_rate() {
           s3_read_requests.exchange(0),
           table_scan_rows.exchange(0) / 1.0 / (1e6));
     }
-    // report
-    // std::fprintf(
-    //     stderr,
-    //     "Internal shuffle request: %lu requests/sec, %.2lf MB/sec\n",
-    //     internal_request_count.load(std::memory_order_relaxed),
-    //     internal_request_bytes.load(std::memory_order_relaxed) / 1.0 /
-    //         (1UL << 20));
-    // std::fprintf(
-    //     stderr,
-    //     "External shuffle request: %lu requests/sec, %.2lf MB/sec\n",
-    //     external_request_count.load(std::memory_order_relaxed),
-    //     external_request_bytes.load(std::memory_order_relaxed) / 1.0 /
-    //         (1UL << 20));
 
-    // std::fprintf(
-    //     stderr,
-    //     "Scan: %.2lf M Rows/sec, filter rate: %.2lf\n",
-    //     table_scan_rows.load(std::memory_order_relaxed) / 1.0 / 1e6,
-    //     table_scan_request_rows ? static_cast<double>(table_scan_rows.load(
-    //                                   std::memory_order_relaxed)) /
-    //             table_scan_request_rows.load(std::memory_order_relaxed)
-    //                             : 0);
-    // wait for next report
     std::this_thread::sleep_for(std::chrono::milliseconds(1000));
   }
 }
@@ -297,13 +303,6 @@ struct RunStats {
     return out.str();
   }
 };
-
-struct ParameterDim {
-  std::string flag;
-  std::vector<std::string> values;
-};
-
-std::shared_ptr<TpchQueryBuilder> queryBuilder;
 
 class ScanBenchmark {
  public:
@@ -339,9 +338,18 @@ class ScanBenchmark {
     aggregate::prestosql::registerAllAggregateFunctions();
     parse::registerTypeResolver();
     filesystems::registerLocalFileSystem();
+    exec::ExchangeSource::registerFactory(
+        exec::test::createLocalExchangeSource);
+    facebook::velox::serializer::presto::PrestoVectorSerde::
+        registerVectorSerde();
 
     ioExecutor_ =
         std::make_unique<folly::IOThreadPoolExecutor>(FLAGS_num_io_threads);
+
+    drivers_ =
+        std::make_unique<folly::CPUThreadPoolExecutor>(FLAGS_num_threads);
+
+    pool_ = memory::memoryManager()->addLeafPool();
 
     // Add new values into the hive configuration...
     auto configurationValues = std::unordered_map<std::string, std::string>();
@@ -359,6 +367,11 @@ class ScanBenchmark {
             connector::hive::HiveConnectorFactory::kHiveConnectorName)
             ->newConnector(kHiveConnectorId, properties, ioExecutor_.get());
     connector::registerConnector(hiveConnector);
+
+    // Query Configs
+    query_configs_["exchange.max_buffer_size"] = "536870912";
+    query_configs_[core::QueryConfig::kMaxSplitPreloadPerDriver] =
+        std::to_string(FLAGS_split_preload_per_driver);
   }
 
   void shutdown() {
@@ -368,59 +381,206 @@ class ScanBenchmark {
     filesystems::finalizeS3FileSystem();
   }
 
-  std::pair<std::unique_ptr<TaskCursor>, std::vector<RowVectorPtr>> run(
-      const TpchPlan& tpchPlan) {
-    int32_t repeat = 0;
+  auto get_task_memeory_pool() {
+    return memory::memoryManager()->addRootPool();
+  }
+
+  void add_scan_splits(
+      std::shared_ptr<Task> task,
+      const core::PlanNodeId& scan_node_id,
+      const std::vector<std::string>& files) {
+    size_t num_files = files.size();
+
+    // std::fprintf(stderr, "\n\nAdding Splits\n\n");
+    // auto start_time = std::chrono::system_clock::now();
+
+    auto ioExecutor = std::make_unique<folly::IOThreadPoolExecutor>(
+        FLAGS_num_adding_split_threads);
+
+    for (int j = 0; j < num_files; j++) {
+      auto const splits = HiveConnectorTestBase::makeHiveConnectorSplits(
+          files[j], FLAGS_num_splits_per_file, FileFormat::PARQUET);
+      for (const auto& split : splits) {
+        ioExecutor->add(
+            [=] { task->addSplit(scan_node_id, exec::Split(split)); });
+      }
+    }
+
+    ioExecutor->join();
+
+    task->noMoreSplits(scan_node_id);
+
+    // auto end_time = std::chrono::system_clock::now();
+    // std::fprintf(
+    //     stderr,
+    //     "\n\nNo More Splits\n\ntime: %ld ms\n\n",
+    //     std::chrono::duration_cast<std::chrono::milliseconds>(
+    //         end_time - start_time)
+    //         .count());
+  }
+
+  std::shared_ptr<Task> make_task(
+      const std::string& taskId,
+      const core::PlanNodePtr& planNode,
+      int destination = 0,
+      Consumer consumer = nullptr) {
+    // auto configCopy = configSettings_;
+    auto queryCtx = std::make_shared<core::QueryCtx>(
+        drivers_.get(), facebook::velox::core::QueryConfig(query_configs_));
+    queryCtx->testingOverrideMemoryPool(get_task_memeory_pool());
+    core::PlanFragment planFragment{planNode};
+    return Task::create(
+        taskId,
+        std::move(planFragment),
+        destination,
+        std::move(queryCtx),
+        std::move(consumer));
+  }
+
+  std::unique_ptr<TaskCursor> get_cursor(const core::PlanNodePtr& plan) {
+    CursorParameters params;
+    params.maxDrivers = FLAGS_num_drivers;
+    params.planNode = plan;
+    params.queryCtx = std::make_shared<core::QueryCtx>(
+        drivers_.get(), facebook::velox::core::QueryConfig(query_configs_));
+    params.queryCtx->testingOverrideMemoryPool(get_task_memeory_pool());
+
+    return TaskCursor::create(params);
+  }
+
+  std::pair<std::shared_ptr<Task>, std::unique_ptr<TaskCursor>>
+  scan_get_cursor() {
+    ScanQueryBuilder builder(FileFormat::PARQUET);
+    builder.initialize(FLAGS_data_path);
+
+    std::vector<std::string> selectedColumns, aggregates;
+    switch (FLAGS_columns) {
+      case 8:
+        // l_linenumber
+        selectedColumns.push_back("l_linenumber");
+        aggregates.push_back("sum(l_linenumber) as l_linenumber");
+        // l_quantity
+        selectedColumns.push_back("l_quantity");
+        aggregates.push_back("sum(l_quantity) as l_quantity");
+      case 6:
+        // l_extendedprice
+        selectedColumns.push_back("l_extendedprice");
+        aggregates.push_back("sum(l_extendedprice) as l_extendedprice");
+        // l_discount
+        selectedColumns.push_back("l_discount");
+        aggregates.push_back("sum(l_discount) as l_discount");
+      case 4:
+        // l_partkey
+        selectedColumns.push_back("l_partkey");
+        aggregates.push_back("max(l_partkey) as l_partkey");
+        // l_suppkey
+        selectedColumns.push_back("l_suppkey");
+        aggregates.push_back("max(l_suppkey) as l_suppkey");
+      case 2:
+        // l_tax
+        selectedColumns.push_back("l_tax");
+        aggregates.push_back("sum(l_tax) as l_tax");
+      case 1:
+        // l_shipdate
+        selectedColumns.push_back("l_shipdate");
+        aggregates.push_back("max(l_shipdate) as l_shipdate");
+    }
+
+    const auto selectedRowType =
+        builder.getRowType(ScanQueryBuilder::kLineitem, selectedColumns);
+    const auto& fileColumnNames =
+        builder.getFileColumnNames(ScanQueryBuilder::kLineitem);
+
+    std::vector<std::vector<TypePtr>> raw_input_types;
+    for (int i = 0; i < FLAGS_columns; i++) {
+      raw_input_types.push_back({selectedRowType->childAt(i)});
+    }
+
+    const auto shipDate = "l_shipdate";
+    std::string lowerBound;
+    if (FLAGS_selectivity <= 0.2) {
+      lowerBound = "'1997-06-09'";
+    } else if (FLAGS_selectivity <= 0.4) {
+      lowerBound = "'1996-02-09'";
+    } else if (FLAGS_selectivity <= 0.6) {
+      lowerBound = "'1994-10-19'";
+    } else if (FLAGS_selectivity <= 0.8) {
+      lowerBound = "'1993-07-05'";
+    } else {
+      lowerBound = "'1992-01-01'";
+    }
+    auto filter = formatDateFilter(shipDate, selectedRowType, lowerBound, "");
+
+    core::PlanNodeId lineitemPlanNodeId, exchangePlanNodeId;
+
+    auto scan_plan = PlanBuilder(pool_.get())
+                         .tableScan(
+                             ScanQueryBuilder::kLineitem,
+                             selectedRowType,
+                             fileColumnNames,
+                             {filter})
+                         .capturePlanNodeId(lineitemPlanNodeId)
+                         .partialAggregation({}, aggregates)
+                         .partitionedOutput({}, 1)
+                         .planNode();
+
+    auto scan_task = make_task("local://scan-0", scan_plan);
+
+    add_scan_splits(
+        scan_task,
+        lineitemPlanNodeId,
+        builder.getTableFilePaths(ScanQueryBuilder::kLineitem));
+
+    auto agg_plan = PlanBuilder(pool_.get())
+                        .exchange(scan_plan->outputType())
+                        .capturePlanNodeId(exchangePlanNodeId)
+                        .localPartition(std::vector<std::string>{})
+                        .finalAggregation({}, aggregates, raw_input_types)
+                        .planNode();
+
+    auto cursor = get_cursor(agg_plan);
+
+    cursor->task()->addSplit(
+        exchangePlanNodeId,
+        exec::Split(std::make_shared<RemoteConnectorSplit>(
+            fmt::format("local://scan-0"))));
+    cursor->task()->noMoreSplits(exchangePlanNodeId);
+
+    return {std::move(scan_task), std::move(cursor)};
+  }
+
+  std::pair<std::unique_ptr<TaskCursor>, std::vector<RowVectorPtr>> run() {
     try {
-      for (;;) {
-        CursorParameters params;
-        params.maxDrivers = FLAGS_num_drivers;
-        params.planNode = tpchPlan.plan;
-        params.queryConfigs[core::QueryConfig::kMaxSplitPreloadPerDriver] =
-            std::to_string(FLAGS_split_preload_per_driver);
-        const int numSplitsPerFile = FLAGS_num_splits_per_file;
+      auto [scan_task, cursor] = scan_get_cursor();
+      auto task = cursor->task();
+      // start cursor first to make sure the result
+      cursor->start();
+      scan_task->start(FLAGS_num_drivers);
 
-        bool noMoreSplits = false;
-        auto addSplits = [&](exec::Task* task) {
-          if (!noMoreSplits) {
-            std::fprintf(stderr, "\n\nAdding Splits\n\n");
-            auto start_time = std::chrono::system_clock::now();
-
-            auto ioExecutor = std::make_unique<folly::IOThreadPoolExecutor>(
-                FLAGS_num_adding_split_threads);
-            for (const auto& entry : tpchPlan.dataFiles) {
-              for (const auto& path : entry.second) {
-                ioExecutor->add([=]() {
-                  auto const splits =
-                      HiveConnectorTestBase::makeHiveConnectorSplits(
-                          path, numSplitsPerFile, tpchPlan.dataFileFormat);
-                  for (const auto& split : splits) {
-                    task->addSplit(entry.first, exec::Split(split));
-                  }
-                });
-              }
-            }
-            ioExecutor->join();
-            for (const auto& entry : tpchPlan.dataFiles) {
-              task->noMoreSplits(entry.first);
-            }
-
-            auto end_time = std::chrono::system_clock::now();
-            std::fprintf(
-                stderr,
-                "\n\nNo More Splits\n\ntime: %ld ms\n\n",
-                std::chrono::duration_cast<std::chrono::milliseconds>(
-                    end_time - start_time)
-                    .count());
-          }
-          noMoreSplits = true;
-        };
-        auto result = readCursor(params, addSplits);
-        ensureTaskCompletion(result.first->task().get());
-        if (++repeat >= FLAGS_num_repeats) {
-          return result;
+      std::vector<RowVectorPtr> result;
+      while (cursor->moveNext()) {
+        result.push_back(cursor->current());
+      }
+      if (!waitForTaskCompletion(task.get(), 5'000'000)) {
+        // NOTE: there is async memory arbitration might fail the task after all
+        // the results have been consumed and before the task finishes. So we
+        // might run into the failed task state in some rare case such as
+        // exposed by concurrent memory arbitration test.
+        if (task->state() != TaskState::kFinished &&
+            task->state() != TaskState::kRunning) {
+          waitForTaskDriversToFinish(task.get(), 5'000'000);
+          std::rethrow_exception(task->error());
+        } else {
+          VELOX_FAIL(
+              "Failed to wait for task to complete after {}, task: {}",
+              succinctMicros(5'000'000),
+              task->toString());
         }
       }
+
+      ensureTaskCompletion(task.get());
+      ensureTaskCompletion(scan_task.get());
+      return {std::move(cursor), std::move(result)};
     } catch (const std::exception& e) {
       LOG(ERROR) << "Query terminated with: " << e.what();
       return {nullptr, std::vector<RowVectorPtr>()};
@@ -428,10 +588,7 @@ class ScanBenchmark {
   }
 
   void runMain(std::ostream& out, RunStats& runStats) {
-    const auto queryPlan = FLAGS_io_meter_column_pct > 0
-        ? queryBuilder->getIoMeterPlan(FLAGS_io_meter_column_pct)
-        : queryBuilder->getScanPlan(FLAGS_columns, FLAGS_selectivity);
-    auto [cursor, actualResults] = run(queryPlan);
+    auto [cursor, actualResults] = run();
     if (!cursor) {
       LOG(ERROR) << "Query terminated with error. Exiting";
       exit(1);
@@ -461,9 +618,9 @@ class ScanBenchmark {
                stats.numTotalSplits,
                stats.numFinishedSplits)
         << std::endl;
-    out << printPlanWithStats(
-               *queryPlan.plan, stats, FLAGS_include_custom_stats)
-        << std::endl;
+    // out << printPlanWithStats(
+    //            *queryPlan.plan, stats, FLAGS_include_custom_stats)
+    // << std::endl;
     double time_seconds =
         (stats.executionEndTimeMs - stats.executionStartTimeMs) / 1000.0;
     if (FLAGS_pretty_print) {
@@ -493,34 +650,30 @@ class ScanBenchmark {
     }
   }
 
+  std::shared_ptr<folly::CPUThreadPoolExecutor> drivers_;
+  std::unordered_map<std::string, std::string> query_configs_;
+
   std::unique_ptr<folly::IOThreadPoolExecutor> ioExecutor_;
   std::unique_ptr<folly::IOThreadPoolExecutor> cacheExecutor_;
   std::shared_ptr<memory::MemoryAllocator> allocator_;
   std::shared_ptr<cache::AsyncDataCache> cache_;
+
+  std::shared_ptr<memory::MemoryPool> pool_;
 
   std::vector<RunStats> runStats_;
 };
 
 ScanBenchmark benchmark;
 
-BENCHMARK(q1) {
-  const auto planContext = queryBuilder->getQueryPlan(1);
-  benchmark.run(planContext);
-}
-
 int scanBenchmarkMain() {
   benchmark.initialize();
-  queryBuilder =
-      std::make_shared<TpchQueryBuilder>(toFileFormat(FLAGS_data_format));
-  queryBuilder->initialize(FLAGS_data_path);
 
-  std::thread t(report_request_rate);
+  // std::thread t(report_request_rate);
   RunStats ignore;
   benchmark.runMain(std::cout, ignore);
-  stop.store(true, std::memory_order_relaxed);
-  t.join();
+  // stop.store(true, std::memory_order_relaxed);
+  // t.join();
 
   benchmark.shutdown();
-  queryBuilder.reset();
   return 0;
 }

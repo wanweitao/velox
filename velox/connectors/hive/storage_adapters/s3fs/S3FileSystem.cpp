@@ -561,6 +561,7 @@ class S3FileSystem::Impl {
     // }
     // Enforce HTTP
     clientConfig.scheme = Aws::Http::Scheme::HTTP;
+    clientConfig.verifySSL = false;
 
     if (hiveConfig_->s3ConnectTimeout().has_value()) {
       clientConfig.connectTimeoutMs =

@@ -16,27 +16,44 @@ add_library(velox_scan_benchmark_lib ScanBenchmark.cpp)
 
 target_link_libraries(
   velox_scan_benchmark_lib
+  scan_query_builder
   velox_aggregates
-  velox_exec
   velox_exec_test_lib
   velox_dwio_common
   velox_dwio_common_exception
   velox_dwio_parquet_reader
-  velox_dwio_common_test_utils
   velox_hive_connector
   velox_exception
   velox_memory
   velox_process
-  velox_serialization
-  velox_encode
-  velox_type
-  velox_type_fbhive
   velox_caching
-  velox_vector_test_lib
   ${FOLLY_BENCHMARK}
   Folly::folly
-  fmt::fmt)
+  fmt::fmt
+)
 
 add_executable(velox_scan_benchmark ScanBenchmarkMain.cpp)
 
 target_link_libraries(velox_scan_benchmark velox_scan_benchmark_lib)
+
+add_library(scan_query_builder ScanQueryBuilder.cpp)
+target_link_libraries(
+  scan_query_builder
+  velox_vector_test_lib
+  velox_temp_path
+  velox_core
+  velox_exception
+  velox_expression
+  velox_parse_parser
+  velox_duckdb_conversion
+  velox_dwio_common
+  velox_dwio_dwrf_reader
+  velox_dwio_dwrf_writer
+  velox_dwio_common_test_utils
+  velox_type_fbhive
+  velox_hive_connector
+  velox_tpch_connector
+  velox_presto_serializer
+  velox_functions_prestosql
+  velox_aggregates
+)
