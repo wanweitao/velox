@@ -57,3 +57,6 @@ target_link_libraries(
   velox_functions_prestosql
   velox_aggregates
 )
+
+add_executable(exchange_benchmark ExchangeBenchmark.cpp)
+target_link_libraries(exchange_benchmark velox_scan_benchmark_lib scan_query_builder)
